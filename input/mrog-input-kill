@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  /usr/local/sbin/mrog-input-kill - destroy the input lease. Nothing else.
+#
+#  This is the ONLY thing in the mrog design that is both root and passwordless
+#  besides mrog-apply, so it is deliberately the smallest program that can
+#  exist: it takes no arguments, reads no input, and its entire effect is to
+#  delete one fixed path.
+#
+#  Why it is safe to hand out without a password:
+#    - It can only ever STOP input. An agent that calls it halts itself.
+#    - Restarting input still costs Chris's password, because that means
+#      granting a new lease, and mrog-input-lease is NOT passwordless.
+#  That asymmetry is the whole point. Stopping should be free; starting must
+#  not be.
+#
+#  It replaces a weakness: the previous halt wrote a flag into the user's own
+#  runtime directory, which an agent running as chris could simply delete and
+#  carry on. The lease lives in /run/mrog, owned by root, so it cannot.
+# ============================================================================
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "mrog-input-kill: root only"; exit 1; }
+[[ $# -eq 0 ]] || { echo "mrog-input-kill: takes no arguments"; exit 1; }
+
+LEASE=/run/mrog/input-lease.json
+
+if [[ -f $LEASE ]]; then
+    rm -f "$LEASE"
+    logger -t mrog-input "LEASE KILLED by ${SUDO_USER:-root} via mrog-input-kill"
+    echo "input lease destroyed"
+else
+    logger -t mrog-input "LEASE KILL requested by ${SUDO_USER:-root} - none was live"
+    echo "no input lease was live"
+fi

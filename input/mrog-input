@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# /usr/local/bin/mrog-input - the verb surface agents call for keyboard, mouse
+# and screen. Runs as chris with NO root of its own and no setuid: on X11,
+# XTEST input needs neither. The only thing it cannot do for itself is arm a
+# lease - that is /usr/local/sbin/mrog-input-lease, and it costs a password.
+#
+# Every mutating event passes six gates, in this order:
+#   1. panic file        - the no-password kill switch
+#   2. live lease        - self-expiring, 15 min ceiling
+#   3. scope             - click and type are armed separately
+#   4. budget + rate     - hard event cap, minimum gap between events
+#   5. human-motion abort- if the pointer moved without us, a human is here
+#   6. window denylist   - never a password prompt, a terminal, or TIER-REAL
+#
+# CORRECTED 2026-09-04: an earlier version of this comment claimed the layer
+# was advisory because /etc/sudoers.d/99-chris-apt granted passwordless root
+# via apt/dpkg. That file DOES NOT EXIST. Measured: `sudo -k; sudo -n apt-get
+# --version` -> "a password is required". The claim came from a stale audit
+# note and was repeated for a whole session without re-checking it.
+#
+# The remaining passwordless rules were read and none is a root bypass: the
+# two mint ones take no arguments and are root-owned, and every apt config
+# directory is root:root 755, so the Pre-Invoke route is closed.
+#
+# The one weakness that IS real: the panic file below lives in the user's
+# runtime dir, so an agent running as chris can delete it and carry on. The
+# kill switch is a convenience brake, not a boundary.
+set -euo pipefail
+
+POLICY=/etc/mrog/input-policy.conf
+LEASE=/run/mrog/input-lease.json
+RT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/mrog"
+PANIC="$RT/input-panic"
+PTR="$RT/input-pointer"
+CNT="$RT/input-count"
+LAST="$RT/input-last"
+DENY="$RT/input-denials"
+LOG=/var/log/mrog/input/events.jsonl
+SID="${MROG_SID:-${SID:-none}}"
+
+MROG_INPUT_MAX_EVENTS=400
+MROG_INPUT_MIN_INTERVAL_MS=60
+MROG_INPUT_DRIFT_TOL=3
+MROG_INPUT_MAX_DENIALS=8
+MROG_INPUT_DENY_CLASS=()
+MROG_INPUT_DENY_TITLE=()
+MROG_INPUT_ALLOW_CLASS=()
+# shellcheck source=/dev/null
+[[ -r $POLICY ]] && source "$POLICY"
+
+mkdir -p "$RT"
+
+record() {  # record <result> <verb> <detail> <class> <title>
+  local ts; ts=$(date -Is)
+  python3 - "$ts" "$SID" "$@" >>"$LOG" 2>/dev/null <<'PY' || true
+import json,sys
+ts,sid,result,verb,detail,cls,title = (sys.argv[1:8] + [""]*7)[:7]
+print(json.dumps({"ts":ts,"sid":sid,"result":result,"verb":verb,
+                  "detail":detail,"class":cls,"title":title}))
+PY
+  logger -t mrog-input "$1 verb=$2 sid=$SID detail=$3 class=${4:-} title=${5:-}"
+}
+
+refuse() {  # refuse <reason> <verb> <detail> [class] [title]
+  record "REFUSED:$1" "$2" "${3:-}" "${4:-}" "${5:-}"
+  echo "mrog-input: REFUSED ($1)" >&2
+  exit 1
+}
+
+trip_panic() {
+  : >"$PANIC"
+  # The flag above lives in the user's runtime dir and an agent running as
+  # chris could delete it. So ALSO destroy the root-owned lease, through a
+  # helper that can do nothing else. Then restarting input costs a password,
+  # because it means granting a new lease. Stopping stays free - an agent that
+  # calls this can only ever halt itself.
+  sudo -n /usr/local/sbin/mrog-input-kill >/dev/null 2>&1 || true
+  logger -t mrog-input "PANIC TRIPPED reason=$1 sid=$SID"
+  echo "mrog-input: input halted - $1" >&2
+}
+
+pointer() { xdotool getmouselocation --shell 2>/dev/null | sed -n 's/^[XY]=//p' | paste -sd' '; }
+
+win_info() {  # prints "class<TAB>title", or fails if there is no focused window
+  local wid cls title
+  wid=$(xdotool getactivewindow 2>/dev/null) || return 1
+  [[ -n $wid ]] || return 1
+  cls=$(xprop -id "$wid" WM_CLASS 2>/dev/null | sed 's/^.*= //; s/"//g; s/, /,/g')
+  title=$(xprop -id "$wid" _NET_WM_NAME 2>/dev/null | sed -n 's/^_NET_WM_NAME([A-Z_]*) = "\(.*\)"$/\1/p')
+  [[ -n $title ]] || title=$(xprop -id "$wid" WM_NAME 2>/dev/null | sed -n 's/^WM_NAME([A-Z_]*) = "\(.*\)"$/\1/p')
+  printf '%s\t%s\n' "${cls:-unknown}" "${title:-unknown}"
+}
+
+lease_field() { python3 -c '
+import json,sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2],""))
+except Exception: print("")' "$LEASE" "$1" 2>/dev/null; }
+
+gate() {  # gate <needed-scope> <verb> <detail>
+  local need="$1" verb="$2" detail="${3:-}"
+
+  [[ -e $PANIC ]] && refuse panic "$verb" "$detail"
+
+  [[ -f $LEASE ]] || refuse no-lease "$verb" "$detail"
+  local scope exp now
+  scope=$(lease_field scope); exp=$(lease_field expires_at); now=$(date +%s)
+  [[ -n $exp ]] || refuse unreadable-lease "$verb" "$detail"
+  (( exp > now )) || refuse expired "$verb" "$detail"
+  [[ $scope == both || $scope == "$need" ]] || refuse "scope-is-$scope-need-$need" "$verb" "$detail"
+
+  local n; n=$(cat "$CNT" 2>/dev/null || echo 0)
+  if (( n >= MROG_INPUT_MAX_EVENTS )); then
+    trip_panic "event budget of $MROG_INPUT_MAX_EVENTS exhausted"
+    refuse budget-exhausted "$verb" "$detail"
+  fi
+
+  local now_ms gap; now_ms=$(date +%s%3N)
+  gap=$(( now_ms - $(cat "$LAST" 2>/dev/null || echo 0) ))
+  (( gap < MROG_INPUT_MIN_INTERVAL_MS )) &&
+    sleep "$(awk -v m="$(( MROG_INPUT_MIN_INTERVAL_MS - gap ))" 'BEGIN{print m/1000}')"
+
+  # --- human-motion abort ---------------------------------------------------
+  # A RADIUS, not a per-axis box: a hand resting on the mouse drifts, and the
+  # old 3 px tolerance would abort on a twitch. Compared as squares so this
+  # stays integer arithmetic with no sqrt.
+  local cur; cur=$(pointer)
+  if [[ -s $PTR && -n $cur ]]; then
+    local px py cx cy dx dy d2 tol2
+    read -r px py <"$PTR"; read -r cx cy <<<"$cur"
+    dx=$(( cx - px )); dy=$(( cy - py ))
+    d2=$(( dx*dx + dy*dy )); tol2=$(( MROG_INPUT_DRIFT_TOL * MROG_INPUT_DRIFT_TOL ))
+    if (( d2 > tol2 )); then
+      trip_panic "pointer moved past the ${MROG_INPUT_DRIFT_TOL}px safe radius - a human is at the machine"
+      refuse human-motion "$verb" "$detail"
+    fi
+  fi
+
+  # --- window denylist, re-checked before EVERY event ---------------------
+  local info cls title lc lt allowed=0
+  info=$(win_info) || refuse no-focused-window "$verb" "$detail"
+  cls=${info%%$'\t'*}; title=${info#*$'\t'}
+  lc=${cls,,}; lt=${title,,}
+
+  # Probe budget. A denylist hit is free to retry, so without this the deny
+  # list can be walked window by window until one accepts a click. The count is
+  # keyed to the lease's granted_at so a new lease resets it on its own.
+  deny_hit() {
+    local ga sga sn d
+    ga=$(lease_field granted_at)
+    # Guard the FILE, not the read: a failed redirection is reported by bash
+    # before 2>/dev/null applies, so this used to print "No such file or
+    # directory" on the first denial of every lease.
+    sga=""; sn=0
+    if [[ -s $DENY ]]; then
+      read -r sga sn <"$DENY" 2>/dev/null || { sga=""; sn=0; }
+    fi
+    [[ "$sga" == "$ga" ]] || sn=0
+    d=$(( ${sn:-0} + 1 ))
+    printf '%s %s\n' "$ga" "$d" >"$DENY"
+    if (( d >= MROG_INPUT_MAX_DENIALS )); then
+      trip_panic "$d denied clicks in one lease - something is probing the deny list"
+      refuse probe-budget-exhausted "$2" "$3" "$4" "$5"
+    fi
+    refuse "$1" "$2" "$3" "$4" "$5"
+  }
+
+  local p
+  for p in "${MROG_INPUT_ALLOW_CLASS[@]}"; do [[ $lc == $p ]] && allowed=1; done
+  if (( ! allowed )); then
+    for p in "${MROG_INPUT_DENY_CLASS[@]}"; do
+      [[ $lc == $p ]] && deny_hit "denied-class" "$verb" "$detail" "$cls" "$title"
+    done
+    for p in "${MROG_INPUT_DENY_TITLE[@]}"; do
+      [[ $lt == $p ]] && deny_hit "denied-title" "$verb" "$detail" "$cls" "$title"
+    done
+  fi
+  # A click that lands clears the suspicion counter.
+  : >"$DENY"
+
+  GATE_CLASS="$cls"; GATE_TITLE="$title"
+  echo $(( n + 1 )) >"$CNT"
+  date +%s%3N >"$LAST"
+}
+
+# --- middle-click paste accounting (added 2026-09-05) -----------------------
+# Button 2 pastes the PRIMARY selection into whatever has focus, and setting
+# PRIMARY (xclip -selection primary) needs no lease. So a "click" lease ALREADY
+# grants arbitrary text entry. That capability is deliberate and stays -- it is
+# how an agent gets text into a window. What was wrong is that the audit could
+# not tell a paste from a click, so text entered the system unrecorded.
+#
+# PRIVACY: `prefix` writes clipboard content to the event log and journald. The
+# primary selection is whatever was last dragged over. Set
+# MROG_INPUT_LOG_PASTE=length to record only the size, or =off for neither.
+MROG_INPUT_LOG_PASTE="${MROG_INPUT_LOG_PASTE:-prefix}"
+MROG_INPUT_PASTE_PREFIX="${MROG_INPUT_PASTE_PREFIX:-60}"
+PASTE_NOTE=""
+
+paste_note() {
+  [[ $MROG_INPUT_LOG_PASTE == off ]] && return 0
+  local sel n
+  sel=$(timeout 1 xclip -o -selection primary 2>/dev/null || true)
+  n=${#sel}
+  if [[ $MROG_INPUT_LOG_PASTE == length ]]; then
+    printf ' paste[len=%d]' "$n"
+  else
+    # Control characters would break the one-line-per-event journald copy.
+    sel=$(printf '%s' "${sel:0:$MROG_INPUT_PASTE_PREFIX}" | tr -d '\000-\037')
+    printf ' paste[len=%d]="%s"' "$n" "$sel"
+  fi
+}
+
+settle() { pointer >"$PTR" 2>/dev/null || true; }
+
+usage() { cat <<'U'
+mrog-input status | audit [n]              what is armed, and what has happened
+mrog-input revoke                          KILL SWITCH - stops everything, no password
+mrog-input where | window                  read-only, no lease needed
+mrog-input shot [path]                     screenshot -> $MROG_SHOTDIR (default Documents/mrog/Screenshots)
+
+  needs --scope click:
+mrog-input move <x> <y>
+mrog-input click [1|2|3]                   1=left 2=middle 3=right
+mrog-input moveclick <x> <y> [btn]
+    NOTE (FLEET-CB2 2026-09-04): button 2 pastes the X PRIMARY selection, and
+    setting PRIMARY needs no lease. A click lease therefore ALREADY grants
+    arbitrary text injection. The real split is pointer+paste vs keystrokes,
+    not text vs no text. See /etc/mrog/input-policy.conf.
+
+  needs --scope type:
+mrog-input type <text>
+mrog-input key <keyspec>                   e.g. ctrl+s, Return, alt+Tab
+
+Arming is Chris's, and costs a password:
+  sudo mrog-input-lease grant 10 --scope click --note "why"
+U
+}
+
+case "${1:-}" in
+  status)
+    if [[ -e $PANIC ]]; then echo "INPUT HALTED (panic file present)"; fi
+    sudo -n /usr/local/sbin/mrog-input-lease status 2>/dev/null ||
+      python3 - "$LEASE" 2>/dev/null <<'PY' || echo "no input lease"
+import json,sys,time
+d=json.load(open(sys.argv[1])); left=int(d["expires_at"]-time.time())
+print(f"scope={d['scope']} by={d['granted_by']} " + (f"{left}s left" if left>0 else "EXPIRED"))
+PY
+    echo "events used: $(cat "$CNT" 2>/dev/null || echo 0) / $MROG_INPUT_MAX_EVENTS"
+    ;;
+
+  revoke)
+    trip_panic "revoked by hand"
+    record REVOKED revoke "" "" ""
+    echo "input halted. To clear it and start again:"
+    echo "  sudo mrog-input-lease grant <min> --scope click|type|both"
+    ;;
+
+  audit)
+    # The parser comes in as a HEREDOC, so the log has to arrive as an
+    # ARGUMENT - piping into `python3 - <<EOF` does not work, because the
+    # heredoc IS stdin and the pipe is discarded. And no -c '...' either:
+    # escaped double quotes inside an f-string inside a single-quoted shell
+    # string are a SyntaxError, which the old 2>/dev/null hid completely.
+    python3 - "$LOG" "${2:-20}" <<'AUDITPY'
+import collections, json, sys
+path, n = sys.argv[1], int(sys.argv[2])
+try:
+    rows = collections.deque(open(path), maxlen=n)
+except Exception:
+    rows = []
+if not rows:
+    print('(no events yet)')
+for line in rows:
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    print(f"{d['ts']}  {d['result']:<24} {d['verb']:<9} "
+          f"{(d.get('class') or '')[:18]:<18} {d.get('detail') or ''}")
+AUDITPY
+    ;;
+
+  where)  pointer ;;
+  window) win_info || echo "no focused window" ;;
+
+  shot)
+    out="${2:-${MROG_SHOTDIR:-$HOME/Documents/mrog/Screenshots}/mrog-$(date +%Y%m%d-%H%M%S).png}"
+    mkdir -p "$(dirname "$out")"
+    geo=$(xdotool getdisplaygeometry 2>/dev/null | tr ' ' 'x')
+    ffmpeg -hide_banner -loglevel error -f x11grab -video_size "${geo:-1920x1200}" \
+           -i "${DISPLAY:-:0}" -frames:v 1 -y "$out"
+    record OK shot "$out" "" ""
+    echo "$out"
+    ;;
+
+  move)
+    x="${2:?x}"; y="${3:?y}"
+    gate click move "$x,$y"
+    xdotool mousemove -- "$x" "$y"
+    settle; record OK move "$x,$y" "$GATE_CLASS" "$GATE_TITLE" ;;
+
+  click)
+    b="${2:-1}"
+    gate click click "btn$b"
+    PASTE_NOTE=""; [[ "$b" == 2 ]] && PASTE_NOTE=$(paste_note)
+    xdotool click -- "$b"
+    settle; record OK click "btn$b$PASTE_NOTE" "$GATE_CLASS" "$GATE_TITLE" ;;
+
+  moveclick)
+    x="${2:?x}"; y="${3:?y}"; b="${4:-1}"
+    gate click moveclick "$x,$y btn$b"
+    xdotool mousemove -- "$x" "$y"
+    settle
+    gate click click "btn$b"
+    PASTE_NOTE=""; [[ "$b" == 2 ]] && PASTE_NOTE=$(paste_note)
+    xdotool click -- "$b"
+    settle; record OK moveclick "$x,$y btn$b$PASTE_NOTE" "$GATE_CLASS" "$GATE_TITLE" ;;
+
+  type)
+    shift; t="${*:?text}"
+    gate type type "${t:0:40}"
+    xdotool type --delay 12 -- "$t"
+    settle; record OK type "${t:0:40}" "$GATE_CLASS" "$GATE_TITLE" ;;
+
+  key)
+    k="${2:?keyspec}"
+    gate type key "$k"
+    xdotool key --delay 12 -- "$k"
+    settle; record OK key "$k" "$GATE_CLASS" "$GATE_TITLE" ;;
+
+  *) usage ;;
+esac

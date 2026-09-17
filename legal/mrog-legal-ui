@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/mrog-legal-ui - polkit target for the Dreamzs weight switch.
+#
+# WHY A ROOT WRAPPER FOR SOMETHING THAT NEEDS NO ROOT.
+# FLEET-CB2 2026-09-05. dreamzs-legal-mode makes zero sudo calls -- it is pure
+# SSH to the GpuBox and the Mini. So this is NOT here to obtain privilege. It
+# is here to obtain an AUTHORISATION: swapping the weights takes every Dreamzs
+# profile on the fleet dark for several minutes, and that deserves a deliberate
+# act. It replaces the typed YES Chris had to sit through, using polkit's own
+# dialog -- the same prompt style as the lease dot.
+#
+# AND WHY IT IMMEDIATELY DROPS BACK.
+# pkexec runs its target as root. The swap needs Chris's SSH keys, which live
+# in his home and are not root's. So this authenticates as an administrator and
+# then runs the real work AS THE INVOKING USER. Root is the gate, never the
+# context the work happens in.
+#
+# The path below is HARDCODED. A pkexec target that takes a program to run as
+# an argument is a privilege escalation with extra steps.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "mrog-legal-ui: root only (via pkexec)"; exit 1; }
+
+WHO="${PKEXEC_UID:-}"
+[[ -n "$WHO" ]] || { echo "mrog-legal-ui: no PKEXEC_UID - refusing"; exit 1; }
+NAME="$(id -nu "$WHO" 2>/dev/null)" || { echo "mrog-legal-ui: unknown uid $WHO"; exit 1; }
+HOMEDIR="$(getent passwd "$WHO" | cut -d: -f6)"
+SCRIPT="$HOMEDIR/bin/dreamzs-legal-mode"
+
+[[ -x "$SCRIPT" ]] || { echo "mrog-legal-ui: $SCRIPT is not executable"; exit 1; }
+
+# runuser, not su: no PAM password prompt, and it does not need one -- polkit
+# already authenticated. --login would reset the environment; we want the
+# user's own HOME and SSH agent context.
+exec runuser -u "$NAME" -- "$SCRIPT" --toggle-bg

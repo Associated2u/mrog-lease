@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/mrog-lease - ONLY Chris runs this, and only with a password.
+# Deliberately NOT in the NOPASSWD sudoers rule: this is the approval gate.
+# Without a live lease, mrog-apply refuses every mutating verb.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "mrog-lease: root only (sudo mrog-lease ...)"; exit 1; }
+D=/run/mrog; L=$D/lease.json; mkdir -p "$D"; chmod 755 "$D"
+
+usage() { cat <<'U'
+mrog-lease grant <minutes> [--scope t1|t2|shell] [--note "why"]   arm agent root, expires by itself
+   t1 = allowlisted units and packages   t2 = + config writes   shell = + arbitrary root (max 60 min)
+mrog-lease status                                            show time remaining
+mrog-lease revoke                                            end it now
+U
+}
+
+case "${1:-}" in
+  grant)
+    mins="${2:?minutes required}"; shift 2 || true
+    scope=t1; note=""
+    while [[ $# -gt 0 ]]; do case "$1" in
+      --scope) scope="$2"; shift 2;; --note) note="$2"; shift 2;; *) shift;; esac; done
+    [[ "$mins" =~ ^[0-9]+$ ]] || { echo "minutes must be a number"; exit 1; }
+    (( mins >= 1 && mins <= 240 )) || { echo "lease must be 1-240 minutes"; exit 1; }
+    [[ "$scope" == t1 || "$scope" == t2 || "$scope" == shell ]] || { echo "scope must be t1, t2 or shell"; exit 1; }
+    if [[ "$scope" == shell ]]; then
+      (( mins <= 60 )) || { echo "a shell lease is capped at 60 minutes"; exit 1; }
+      rm -f /run/mrog/shell-warned
+      echo "SHELL LEASE: agents can run arbitrary root commands until it expires."
+      echo "Every one is journalled with its output in /var/log/mrog/run/."
+    fi
+    now=$(date +%s); exp=$(( now + mins*60 ))
+    printf '{"granted_at":%d,"expires_at":%d,"scope":"%s","granted_by":"%s","note":%s}\n' \
+      "$now" "$exp" "$scope" "${SUDO_USER:-root}" "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$note")" > "$L"
+    chmod 644 "$L"
+    echo "lease: scope=$scope for ${mins}m, expires $(date -d "@$exp" '+%H:%M:%S')"
+    logger -t mrog "lease granted scope=$scope mins=$mins by=${SUDO_USER:-root} note=$note"
+    ;;
+  status)
+    [[ -f $L ]] || { echo "no lease"; exit 1; }
+    python3 - "$L" <<'PY'
+import json,sys,time
+d=json.load(open(sys.argv[1])); left=int(d["expires_at"]-time.time())
+print(f"scope={d['scope']} by={d['granted_by']} " + (f"{left}s left" if left>0 else "EXPIRED") + (f" note={d['note']}" if d.get('note') else ""))
+sys.exit(0 if left>0 else 1)
+PY
+    ;;
+  revoke) rm -f "$L"; echo "lease revoked"; logger -t mrog "lease revoked by ${SUDO_USER:-root}";;
+  *) usage;;
+esac

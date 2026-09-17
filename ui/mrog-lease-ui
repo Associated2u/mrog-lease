@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/mrog-lease-ui - the ONLY thing the notch dot may invoke.
+#
+# CORRECTED 2026-09-05, same day it was written. The first version granted the
+# ROOT lease (mrog-lease, ORANGE dot). Chris asked for the thing his own note
+# holds:
+#     sudo mrog-input-lease grant 10 --scope click --note "..."
+# which is the INPUT lease -- agent keyboard/mouse, RED dot. He clicked the
+# button, got root he had not asked for, and then could not stop it because
+# the notch handler only revoked an INPUT lease. Wrong lease, and no brake.
+#
+# So: `input` is the default and what the dot uses. `root` still exists but
+# must be asked for by name, and `revoke` ends either one.
+#
+# The prompt is polkit's OWN dialog. Nothing here draws a password box and
+# nothing here ever sees a password: an agent-written password window is
+# indistinguishable from phishing, and input-policy.conf already denies agent
+# input to *polkit* windows -- so an agent can summon this and can never click
+# through it.
+#
+# A pkexec target must have a CONSTRAINED argument surface, because the polkit
+# policy authorises the PATH and not the arguments. Everything below is
+# validated here, as root, against a whitelist.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "mrog-lease-ui: root only (via pkexec)"; exit 1; }
+
+WHAT="${1:-input}"
+MINS="${2:-10}"
+SCOPE="${3:-}"
+
+WHO="${PKEXEC_UID:-}"
+NAME="$( [[ -n $WHO ]] && id -nu "$WHO" 2>/dev/null || echo unknown )"
+
+[[ "$MINS" =~ ^[0-9]+$ ]] || { echo "minutes must be a number"; exit 2; }
+(( MINS >= 1 )) || MINS=1
+
+case "$WHAT" in
+  input)
+    # Agent keyboard/mouse. Matches Chris's own note: 10 min, scope click.
+    SCOPE="${SCOPE:-click}"
+    case "$SCOPE" in click|type|both) ;; *) echo "input scope: click|type|both"; exit 2 ;; esac
+    (( MINS <= 15 )) || MINS=15          # mrog-input-lease ceiling
+    exec /usr/local/sbin/mrog-input-lease grant "$MINS" --scope "$SCOPE" \
+         --note "granted from the notch dot by $NAME"
+    ;;
+  root)
+    # Agent root. Deliberately NOT the default and never what the dot sends.
+    SCOPE="${SCOPE:-t1}"
+    case "$SCOPE" in t1|t2|shell) ;; *) echo "root scope: t1|t2|shell"; exit 2 ;; esac
+    if [[ "$SCOPE" == "shell" ]]; then (( MINS <= 30 )) || MINS=30
+    else (( MINS <= 60 )) || MINS=60; fi
+    exec /usr/local/sbin/mrog-lease grant "$MINS" --scope "$SCOPE" \
+         --note "granted from the notch dot by $NAME"
+    ;;
+  revoke)
+    # Stopping must always be possible. Ends both, ignoring whichever is absent.
+    /usr/local/sbin/mrog-lease revoke 2>/dev/null || true
+    /usr/local/sbin/mrog-input-lease revoke 2>/dev/null || true
+    echo "all leases revoked"
+    ;;
+  *)
+    echo "usage: mrog-lease-ui [input|root|revoke] [minutes] [scope]"; exit 2 ;;
+esac

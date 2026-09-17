@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  /usr/share/polkit-1/actions/com.mrog.legal.policy
+  FLEET-CB2 2026-09-05.
+
+  Authorises the Dreamzs weight switch. This is a CONFIRMATION gate, not a
+  privilege grant: the swap itself needs no root, and the wrapper drops back to
+  the invoking user immediately. It exists because the swap takes every Dreamzs
+  profile on the fleet dark for several minutes.
+
+  auth_admin, NOT auth_admin_keep: every swap is asked for separately. A
+  keep-alive would let a second, unintended outage through on one password.
+-->
+<policyconfig>
+  <vendor>mrog</vendor>
+  <vendor_url>https://localhost</vendor_url>
+
+  <action id="com.mrog.legal.toggle">
+    <description>Switch the Dreamzs fleet between LEGAL and NORMAL weights</description>
+    <message>Authentication is required to swap the Dreamzs models. Every profile on the fleet goes offline for several minutes.</message>
+    <icon_name>application-certificate</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/sbin/mrog-legal-ui</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

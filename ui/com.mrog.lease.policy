@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  /usr/share/polkit-1/actions/com.mrog.lease.policy
+  FLEET-CB2 2026-09-05.
+
+  Lets the notch dot raise polkit's OWN password dialog to arm an agent root
+  lease.
+
+  ==========================================================================
+  FIXED 2026-09-05 from the Omarchy desktop. TWO bugs, one of them serious.
+
+  BUG 1, THE SERIOUS ONE: this file was NOT VALID XML, and polkit was
+  silently dropping the whole action. A comment line carried a DOUBLE HYPHEN,
+  which XML forbids inside a comment. The offending line was the one
+  describing why remote sessions are refused; the two dashes it used as
+  punctuation are what broke it.
+
+  This failed silently in the worst way. The file was present, correct
+  looking, and readable, and everything about it invited the conclusion that
+  it was in force. It was not. On mrog, listing polkit actions showed
+  com.mrog.legal.toggle and did NOT show com.mrog.lease.grant.
+
+  What happened instead: with the action unregistered, pkexec falls back to
+  org.freedesktop.policykit.exec, whose defaults allow BOTH any and inactive
+  sessions subject to an admin password. So the rule this file exists to
+  state, that the gate must never be reachable from a remote or switched away
+  session, was not merely absent. The fallback permits precisely that.
+
+  NOTE FOR WHOEVER EDITS THIS NEXT: no double hyphen may appear anywhere in
+  this comment, including inside example commands. Validate the file before
+  trusting it; presence on disk proves nothing, as the last four hours show.
+
+  BUG 2: allow_active was auth_admin_keep. The keep was deliberate, reasoned
+  as covering a mis-click. It does, but it also covers an AGENT. An agent can
+  invoke pkexec too, and inside polkit's keep window a grant is authorised
+  SILENTLY, with no dialog and no chance for Chris to see it, turning the
+  approval gate into one click then free for the rest of the window. It is
+  now auth_admin with no keep. The cost is a password on every grant,
+  including after a mis-click. That is the correct price for a capability an
+  agent is allowed to ask for.
+  ==========================================================================
+
+  allow_any and allow_inactive are both no on purpose. This must only be
+  reachable from a real, active, local session, never from a remote or
+  switched away one.
+-->
+<policyconfig>
+  <vendor>mrog</vendor>
+  <vendor_url>https://localhost</vendor_url>
+
+  <action id="com.mrog.lease.grant">
+    <description>Arm an agent root lease</description>
+    <message>Authentication is required to give an agent temporary root on this machine.</message>
+    <icon_name>dialog-password</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/sbin/mrog-lease-ui</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

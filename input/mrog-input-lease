@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/mrog-input-lease - ONLY Chris runs this, and only with a
+# password. Deliberately NOT in the NOPASSWD sudoers rule: this is the
+# approval gate for agent keyboard/mouse control.
+#
+# Tighter than mrog-lease on purpose. An agent with a keyboard is MORE
+# dangerous than an agent with a root shell: it can type into a terminal
+# (which guard-bash cannot see), click "Yes" on a polkit prompt, and drive a
+# logged-in browser across the whole TIER-REAL surface. So: 15 minutes not
+# 240, and "click" and "type" are armed separately.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "mrog-input-lease: root only (sudo mrog-input-lease ...)"; exit 1; }
+
+D=/run/mrog; L=$D/input-lease.json; mkdir -p "$D"; chmod 755 "$D"
+POLICY=/etc/mrog/input-policy.conf
+MROG_INPUT_MAX_MIN=15
+# shellcheck source=/dev/null
+[[ -r $POLICY ]] && source "$POLICY"
+
+# The panic file lives in the user's runtime dir so that revoking NEVER needs
+# a password - you must always be able to stop this without authenticating.
+user="${SUDO_USER:-chris}"
+uid=$(id -u "$user")
+PANIC="/run/user/$uid/mrog/input-panic"
+
+usage() { cat <<'U'
+mrog-input-lease grant <minutes> --scope click|type|both [--note "why"]
+mrog-input-lease status
+mrog-input-lease revoke
+U
+}
+
+case "${1:-}" in
+  grant)
+    mins="${2:?minutes required}"; shift 2 || true
+    scope=""; note=""
+    while [[ $# -gt 0 ]]; do case "$1" in
+      --scope) scope="$2"; shift 2;; --note) note="$2"; shift 2;; *) shift;; esac; done
+    [[ "$mins" =~ ^[0-9]+$ ]] || { echo "minutes must be a number"; exit 1; }
+    (( mins >= 1 && mins <= MROG_INPUT_MAX_MIN )) || {
+      echo "input lease must be 1-${MROG_INPUT_MAX_MIN} minutes"; exit 1; }
+    case "$scope" in
+      click|type|both) ;;
+      *) echo "--scope is required and must be click, type or both"; echo
+         echo "  click = move and click only"
+         echo "  type  = keystrokes only"
+         echo "  both  = arm them together (say why in --note)"; exit 1;;
+    esac
+
+    now=$(date +%s); exp=$(( now + mins*60 ))
+    printf '{"granted_at":%d,"expires_at":%d,"scope":"%s","granted_by":"%s","note":%s}\n' \
+      "$now" "$exp" "$scope" "$user" \
+      "$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$note")" > "$L"
+    chmod 644 "$L"
+
+    # A fresh grant clears a previous panic and the per-lease counters.
+    install -d -o "$user" -m 0700 "/run/user/$uid/mrog" 2>/dev/null || true
+    rm -f "$PANIC" "/run/user/$uid/mrog/input-pointer" "/run/user/$uid/mrog/input-count"
+
+    echo "input lease: scope=$scope for ${mins}m, expires $(date -d "@$exp" '+%H:%M:%S')"
+    echo "the notch dot goes RED while this is live. 'mrog-input revoke' stops it, no password."
+    logger -t mrog-input "LEASE GRANTED scope=$scope mins=$mins by=$user note=$note"
+    ;;
+
+  status)
+    [[ -f $L ]] || { echo "no input lease"; exit 1; }
+    python3 - "$L" <<'PY'
+import json,sys,time
+d=json.load(open(sys.argv[1])); left=int(d["expires_at"]-time.time())
+print(f"scope={d['scope']} by={d['granted_by']} " +
+      (f"{left}s left" if left>0 else "EXPIRED") +
+      (f" note={d['note']}" if d.get('note') else ""))
+sys.exit(0 if left>0 else 1)
+PY
+    ;;
+
+  revoke)
+    rm -f "$L"
+    echo "input lease revoked"
+    logger -t mrog-input "LEASE REVOKED by ${SUDO_USER:-root}"
+    ;;
+
+  *) usage;;
+esac

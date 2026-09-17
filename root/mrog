@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# /usr/local/bin/mrog - the verb surface agents call. Runs as chris, no root of
+# its own; every mutating verb goes through sudo -n /usr/local/sbin/mrog-apply,
+# which is inert until Chris grants a lease.
+set -euo pipefail
+A="sudo -n /usr/local/sbin/mrog-apply"
+export MROG_SID="${MROG_SID:-${SID:-none}}"
+# leave the session id where the root wrapper can read it (the env is stripped)
+mkdir -p "$HOME/.config/mrog" 2>/dev/null && printf '%s\n' "$MROG_SID" > "$HOME/.config/mrog/sid" 2>/dev/null
+
+case "${1:-}" in
+  lease)        shift; exec sudo /usr/local/sbin/mrog-lease grant "$@" ;;   # password: Chris only
+  lease-status) exec $A lease-status ;;
+  # FLEET-4HY: stopping root is free once mrog-lease-kill is installed (sudo -n = never
+  # prompt); until then, or if the rule is missing, fall back to the password path.
+  unlease)      sudo -n /usr/local/sbin/mrog-lease-kill 2>/dev/null && exit 0
+                exec sudo /usr/local/sbin/mrog-lease revoke ;;
+
+  stage)   # mrog stage <target>  -> copies it somewhere writable to edit
+    t="${2:?target}"; s="/tmp/mrog-stage$(echo "$t" | tr / .)"
+    cp -a "$t" "$s" 2>/dev/null || : > "$s"
+    echo "$s" ;;
+
+  diff)    shift; exec $A diff "$@" ;;
+  apply)   shift; exec $A write "$@" ;;
+  revert)  shift; exec $A revert "$@" ;;
+  run)     shift; exec $A run "$@" ;;
+  snapshot) shift; exec $A snapshot "$@" ;;
+  svc)     shift; exec $A svc "$@" ;;
+  pkg)     shift; exec $A pkg "$@" ;;
+
+  audit)   tail -n "${2:-20}" /var/log/mrog/changes.jsonl | python3 -c '
+import sys, json
+for line in sys.stdin:
+    d = json.loads(line)
+    print("%s  %8s/%-10s %-8s %-9s %s" % (d["ts"][:19], d["caller"], d["sid"],
+                                          d["verb"], d["result"], d["target"]))' ;;
+
+  doctor)  # drift, no root needed
+    B="$HOME/.config/mrog/baseline-units"
+    now=$(systemctl list-unit-files --state=enabled --no-pager | grep -c enabled)
+    if [[ -f $B ]]; then base=$(cat "$B"); else base=$now; echo "$now" > "$B"; fi
+    echo "== enabled units: $now (baseline $base)"
+    echo "== /etc uncommitted:"
+    out=$($A etc-status 2>/dev/null) && { [[ -n $out ]] && echo "$out" | sed 's/^/   /' || echo "   clean"; } \
+        || echo "   (could not read /etc git)"
+    echo "== last timeshift snapshot:"
+    ls -1dt /timeshift/snapshots/*/ 2>/dev/null | head -1 | sed 's/^/   /' || echo "   none"
+    echo "== last backup:"
+    bash "${MROG_ROOT:-$HOME/mrog}/backup-restic.sh" --check 2>&1 | tail -1 | sed 's/^/   /'
+    echo "== lease:"
+    { $A lease-status 2>/dev/null | sed 's/^/   scope /'; } || echo "   none"
+    ;;
+
+  *) cat <<'U'
+mrog lease <minutes> [--scope t1|t2] [--note "why"]   Chris only - arms agent root, self-expiring
+mrog lease-status | unlease
+mrog stage <target>                 make an editable copy, prints its path
+mrog diff <target> <staged>         show the change + its confirm-token   (no lease needed)
+mrog apply <target> <staged> <tok>  write it: validated, /etc-committed, journalled  (t2)
+mrog revert <target>                back to /etc git HEAD                 (t2)
+mrog run <command...>               arbitrary root, journalled with its output (shell lease)
+mrog snapshot [label]               timeshift restore point               (t1)
+mrog svc <start|stop|restart|status> <unit>                               (t1)
+mrog pkg add <name>                                                       (t1)
+mrog audit [n] | doctor
+U
+  ;;
+esac

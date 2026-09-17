@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# /usr/local/sbin/mrog-apply - the ONLY thing agents may run as root without a password.
+# Inert unless Chris has armed a lease (mrog-lease grant), and even then every
+# action is allowlisted, validated, snapshotted into /etc git, and journalled.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "mrog-apply: root only"; exit 1; }
+
+POLICY=/etc/mrog/policy.conf
+JOURNAL=/var/log/mrog/changes.jsonl
+LEASE=/run/mrog/lease.json
+CALLER="${SUDO_USER:-unknown}"
+# sudo env_reset strips MROG_SID, so every journal line said sid=none.
+# The driver leaves the session id in a file the caller owns; it is a label,
+# not a credential, so reading it from the caller's config is fine.
+# FLEET-V26: the caller's home comes from the passwd db, never a fixed path. MROG_HOME and
+# MROG_ROOT are exported BEFORE the policy is sourced so its patterns can name them.
+CALLER_HOME="$(getent passwd "$CALLER" 2>/dev/null | cut -d: -f6)"
+export MROG_HOME="${CALLER_HOME:-/nonexistent}"
+export MROG_ROOT="${MROG_ROOT:-$MROG_HOME/mrog}"
+SID="${MROG_SID:-$(cat "$MROG_HOME/.config/mrog/sid" 2>/dev/null || echo none)}"
+mkdir -p "$(dirname "$JOURNAL")"; touch "$JOURNAL"; chmod 640 "$JOURNAL"
+# shellcheck source=/dev/null
+[[ -f $POLICY ]] && . "$POLICY" || { echo "missing $POLICY"; exit 30; }
+
+die()   { echo "mrog-apply: $*" >&2; exit "${2:-30}"; }
+jlog()  { # jlog <verb> <target> <result> <extra-json>
+  local extra="${4:-}"; [[ -z $extra ]] && extra="{}"
+  python3 - "$JOURNAL" "$1" "$2" "$3" "$extra" "$CALLER" "$SID" <<'PY'
+import json,sys,time
+p,verb,target,result,extra,caller,sid=sys.argv[1:8]
+rec={"ts":time.strftime("%Y-%m-%dT%H:%M:%S%z"),"sid":sid,"caller":caller,
+     "verb":verb,"target":target,"result":result}
+try: rec.update(json.loads(extra))
+except Exception: pass
+open(p,"a").write(json.dumps(rec)+"\n")
+PY
+}
+
+lease_scope() {  # prints t1|t2, or empty if none/expired
+  [[ -f $LEASE ]] || return 1
+  python3 - "$LEASE" <<'PY'
+import json,sys,time
+d=json.load(open(sys.argv[1]))
+if d["expires_at"] > time.time():
+    print(d["scope"]); sys.exit(0)
+sys.exit(1)
+PY
+}
+rank() { case "$1" in t1) echo 1;; t2) echo 2;; shell) echo 3;; *) echo 0;; esac; }
+need_lease() {  # need_lease t1|t2|shell
+  local want="$1" have
+  have=$(lease_scope 2>/dev/null) || { jlog "$want" "-" refused '{"why":"no live lease"}'; die "no live lease - ask Chris: sudo mrog-lease grant 20 --scope $want" 30; }
+  if (( $(rank "$have") < $(rank "$want") )); then
+    jlog "$want" "-" refused '{"why":"lease scope too low"}'; die "lease is scope=$have, this needs $want" 30
+  fi
+}
+# FLEET-4HY 2026-09-17 -- CANONICALISE BEFORE ANY POLICY DECISION. denied() and
+# allowed_write() are literal glob matches, so "/etc//shadow", "/etc/../etc/shadow" and
+# "/etc/ssh/../shadow" all MISSED the never-touch list and still matched the "/etc/*"
+# allowlist -- measured against the live policy -- and `install` then writes the literal
+# path, which the kernel resolves to /etc/shadow. realpath -m resolves . .. // and symlinks
+# without requiring the file to exist. Every verb that takes a target goes through this.
+canon() {
+  local c
+  c=$(realpath -m -- "$1" 2>/dev/null) || die "cannot canonicalise: $1"
+  [[ "$c" = /* ]] || die "target must be absolute: $1"
+  [[ "$c" == "$1" ]] || echo "note: $1 -> $c" >&2
+  printf '%s' "$c"
+}
+denied() {  # denied <abs path>  -> true if on the never-touch list
+  local t="$1" pat
+  for pat in "${MROG_DENY[@]}"; do [[ "$t" == $pat ]] && return 0; done
+  return 1
+}
+allowed_write() {
+  local t="$1" pat
+  for pat in "${MROG_WRITE_ALLOW[@]}"; do [[ "$t" == $pat ]] && return 0; done
+  return 1
+}
+difftoken() { local base="$1"; [[ -f $base ]] || base=/dev/null
+              { diff -u "$base" "$2" 2>/dev/null || true; } | sha256sum | cut -c1-16; }
+in_list() { local n="$1"; shift; local x; for x in "$@"; do [[ "$n" == "$x" ]] && return 0; done; return 1; }
+
+validate() {  # validate <target> <staged file>
+  local t="$1" s="$2"
+  case "$t" in
+    /etc/systemd/system/*.service|/etc/systemd/system/*.timer|/etc/systemd/system/*.socket)
+        tmp=$(mktemp -d); cp "$s" "$tmp/$(basename "$t")"
+        out=$(systemd-analyze verify "$tmp/$(basename "$t")" 2>&1); rm -rf "$tmp"
+        [[ -n "$out" ]] && { echo "systemd-analyze verify: $out"; return 1; }
+        echo "systemd-analyze verify: ok";;
+    /etc/ssh/sshd_config|/etc/ssh/sshd_config.d/*)
+        sshd -t -f "$s" || return 1; echo "sshd -t: ok";;
+    /etc/sysctl.d/*.conf|/etc/sysctl.conf)
+        grep -vE '^\s*(#|;|$)' "$s" | grep -qvE '^[a-z0-9_.]+\s*=\s*\S+' && { echo "sysctl syntax"; return 1; }
+        echo "sysctl syntax: ok";;
+    *.sh|/usr/local/bin/*|/usr/local/sbin/*)
+        bash -n "$s" || return 1
+        if command -v shellcheck >/dev/null; then
+            shellcheck -S error "$s" || return 1; echo "bash -n + shellcheck: ok"
+        else
+            echo "bash -n: ok (shellcheck NOT installed)"
+        fi;;
+    *)  echo "no validator for this target (diff + snapshot + journal only)";;
+  esac
+  return 0
+}
+
+case "${1:-}" in
+
+  lease-status) lease_scope || { echo "no live lease"; exit 1; } ;;
+
+  etc-status)   git -C /etc status --porcelain | head -20 ;;
+
+  snapshot)
+    need_lease t1; label="${2:-mrog}"
+    timeshift --create --comments "mrog:$label ($CALLER/$SID)" --tags O >/dev/null 2>&1 \
+      && { jlog snapshot "$label" ok; echo "snapshot taken"; } \
+      || { jlog snapshot "$label" failed; die "timeshift snapshot failed" 20; }
+    ;;
+
+  svc)
+    need_lease t1; act="${2:?start|stop|restart|status}"; unit="${3:?unit}"
+    in_list "$act" start stop restart status || die "svc: bad action"
+    in_list "$unit" "${MROG_UNITS[@]}" || { jlog svc "$unit" refused '{"why":"unit not allowlisted"}'; die "unit not allowlisted: $unit"; }
+    rc=0; systemctl "$act" "$unit" || rc=$?
+    jlog svc "$unit" "$([[ $rc -eq 0 ]] && echo ok || echo failed)" "{\"action\":\"$act\"}"
+    exit $rc
+    ;;
+
+  pkg)
+    need_lease t1; act="${2:?add}"; name="${3:?package}"
+    [[ "$act" == add ]] || die "pkg: only 'add' is allowed"
+    in_list "$name" "${MROG_PKGS[@]}" || { jlog pkg "$name" refused '{"why":"package not allowlisted"}'; die "package not allowlisted: $name"; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$name" || { jlog pkg "$name" failed; die "apt install failed" 20; }
+    jlog pkg "$name" ok; etckeeper commit "mrog: apt install $name ($CALLER/$SID)" 2>/dev/null || true
+    ;;
+
+  diff)
+    target=$(canon "${2:?target}"); staged="${3:?staged file}"
+    [[ -f $staged ]] || die "staged file not found"
+    diff -u "$target" "$staged" 2>/dev/null || true
+    echo "---"
+    echo "confirm-token: $(difftoken "$target" "$staged")"
+    ;;
+
+  write)
+    need_lease t2
+    target=$(canon "${2:?target}"); staged="${3:?staged file}"; token="${4:-}"
+    [[ -f $staged ]] || die "staged file not found"
+    denied "$target"        && { jlog write "$target" refused '{"why":"never-touch list"}'; die "T3 never-touch: $target"; }
+    allowed_write "$target" || { jlog write "$target" refused '{"why":"outside write allowlist"}'; die "outside write allowlist: $target"; }
+    real=$(difftoken "$target" "$staged")
+    [[ -f $target && "$real" == "e3b0c44298fc1c14" ]] && { jlog write "$target" noop; echo "no change - nothing written"; exit 10; }
+    [[ "$token" == "$real" ]] || { jlog write "$target" refused '{"why":"confirm token mismatch"}'; die "confirm token mismatch (run: mrog diff first). expected $real"; }
+    v=$(validate "$target" "$staged") || { jlog write "$target" refused '{"why":"validator failed"}'; die "validator failed: $v" 20; }
+    [[ -f $target ]] && cp -a "$target" "/var/backups/mrog-$(basename "$target").$(date +%s)" || true
+    if install -m "$(stat -c %a "$target" 2>/dev/null || echo 644)" -o root -g root "$staged" "$target"; then
+        [[ "$target" == /etc/* ]] && etckeeper commit "mrog: write $target ($CALLER/$SID)" >/dev/null 2>&1 || true
+        jlog write "$target" applied "{\"validator\":\"${v//\"/}\",\"diff\":\"$real\"}"
+        echo "applied: $target   [$v]"
+    else
+        jlog write "$target" failed '{"why":"install failed"}'; die "install failed" 20
+    fi
+    ;;
+
+  run)
+    need_lease shell
+    shift
+    [[ $# -ge 1 ]] || die "run: give me a command"
+    cmdline="$*"
+    for pat in "${MROG_SHELL_DENY[@]}"; do
+      if [[ "$cmdline" == $pat ]]; then
+        jlog run "$cmdline" refused '{"why":"shell denylist"}'
+        die "refused by the shell denylist: $pat" 30
+      fi
+    done
+    mkdir -p /var/log/mrog/run || true
+    chmod 750 /var/log/mrog/run 2>/dev/null || true
+    chown root:adm /var/log/mrog/run 2>/dev/null || true
+    ts=$(date +%s); rlog="/var/log/mrog/run/$ts.log"
+    # First run of each lease: say how old the newest restore point is. It does
+    # NOT take one - snapshots are manual by ruling.
+    marker="/run/mrog/shell-warned"
+    if [[ ! -f $marker ]]; then
+      newest=$(ls -1dt /timeshift/snapshots/*/ 2>/dev/null | head -1)
+      if [[ -n $newest ]]; then
+        age=$(( ( $(date +%s) - $(stat -c %Y "$newest") ) / 86400 ))
+        echo "note: newest Timeshift restore point is ${age} days old ($(basename "$newest"))"
+        (( age > 7 )) && echo "      consider: sudo timeshift --create   before heavy work"
+      else
+        echo "note: there is NO Timeshift restore point on this machine"
+      fi
+      : > "$marker"
+    fi
+    { echo "# $(date -Is)  caller=$CALLER sid=$SID"; echo "# \$ $cmdline"; echo; } > "$rlog"
+    set +e
+    bash -c "$cmdline" > >(tee -a "$rlog") 2> >(tee -a "$rlog" >&2)
+    rc=$?
+    set -e
+    chmod 640 "$rlog" 2>/dev/null || true; chown root:adm "$rlog" 2>/dev/null || true
+    jlog run "$cmdline" "$([[ $rc -eq 0 ]] && echo ok || echo "exit$rc")" "{\"log\":\"$rlog\",\"rc\":$rc}"
+    exit $rc
+    ;;
+
+  revert)
+    need_lease t2; target=$(canon "${2:?target}")
+    [[ "$target" == /etc/* ]] || die "revert only handles /etc (elsewhere: timeshift)"
+    denied "$target" && die "T3 never-touch: $target"
+    git -C /etc checkout HEAD -- "${target#/etc/}" || die "git checkout failed" 20
+    jlog revert "$target" applied; echo "reverted from /etc git HEAD: $target"
+    ;;
+
+  *) cat <<'U'
+mrog-apply lease-status
+mrog-apply snapshot [label]              (t1)
+mrog-apply svc <start|stop|restart|status> <unit>   (t1, allowlisted units)
+mrog-apply pkg add <name>                (t1, allowlisted packages)
+mrog-apply diff <target> <staged>        (no lease - read only, prints confirm-token)
+mrog-apply write <target> <staged> <confirm-token>  (t2)
+mrog-apply revert <target>               (t2, /etc git)
+mrog-apply run <command...>              (shell lease: arbitrary root, journalled with output)
+U
+    ;;
+esac
